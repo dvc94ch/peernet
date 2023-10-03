@@ -5,7 +5,7 @@ use iroh_net::magic_endpoint::accept_conn;
 use iroh_net::{AddrInfo, MagicEndpoint, PeerAddr};
 use pkarr::dns::rdata::{RData, A, AAAA, TXT};
 use pkarr::dns::{Name, Packet, ResourceRecord, CLASS};
-use pkarr::{Bep44Args, RelayClient};
+use pkarr::{PkarrClient, SignedPacket, Url};
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
@@ -56,7 +56,8 @@ pub struct Endpoint {
     secret: [u8; 32],
     alpn: Vec<u8>,
     endpoint: MagicEndpoint,
-    pkarr: RelayClient,
+    pkarr: PkarrClient,
+    pkarr_relay: Url,
 }
 
 impl Endpoint {
@@ -67,7 +68,8 @@ impl Endpoint {
         pkarr_relay: &str,
         derp_map: Option<DerpMap>,
     ) -> Result<Self> {
-        let pkarr = RelayClient::new(pkarr_relay)?;
+        let pkarr = PkarrClient::new();
+        let pkarr_relay = pkarr_relay.parse()?;
         let builder = MagicEndpoint::builder()
             .secret_key(SecretKey::from(secret))
             .alpns(vec![alpn.to_vec()]);
@@ -81,6 +83,7 @@ impl Endpoint {
             secret,
             alpn: alpn.to_vec(),
             endpoint,
+            pkarr_relay,
             pkarr,
         })
     }
@@ -92,7 +95,10 @@ impl Endpoint {
     pub async fn resolve(&self, peer_id: &PeerId) -> Result<PeerAddr> {
         let msg = self
             .pkarr
-            .get(pkarr::PublicKey::try_from(*peer_id.as_bytes()).unwrap())
+            .relay_get(
+                &self.pkarr_relay,
+                pkarr::PublicKey::try_from(*peer_id.as_bytes()).unwrap(),
+            )
             .await?;
         let packet = msg.packet()?;
         let direct_addresses = packet
@@ -137,8 +143,8 @@ impl Endpoint {
             ));
         }
         let keypair = pkarr::Keypair::from_secret_key(&self.secret);
-        let packet = Bep44Args::from_packet(&keypair, &packet)?;
-        self.pkarr.put(packet).await?;
+        let packet = SignedPacket::from_packet(&keypair, &packet)?;
+        self.pkarr.relay_put(&self.pkarr_relay, packet).await?;
         Ok(())
     }
 

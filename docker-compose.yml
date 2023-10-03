@@ -1,0 +1,11 @@
+version: '3.9'
+services:
+  derper:
+    image: n0-computer/derper
+    ports:
+    - '3340:443'
+    - '3478:3478'
+  pkarr:
+    image: nuhvi/pkarr
+    ports:
+    - '6881:6881'

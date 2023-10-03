@@ -1,5 +1,5 @@
 use anyhow::Result;
-use iroh_net::derp::DerpMap;
+use iroh_net::derp::{DerpMap, DerpMode};
 use iroh_net::key::SecretKey;
 use iroh_net::magic_endpoint::accept_conn;
 use iroh_net::{AddrInfo, MagicEndpoint, PeerAddr};
@@ -74,9 +74,9 @@ impl Endpoint {
             .secret_key(SecretKey::from(secret))
             .alpns(vec![alpn.to_vec()]);
         let builder = if let Some(derp_map) = derp_map {
-            builder.enable_derp(derp_map)
+            builder.derp_mode(DerpMode::Custom(derp_map))
         } else {
-            builder
+            builder.derp_mode(DerpMode::Disabled)
         };
         let endpoint = builder.bind(port).await?;
         Ok(Self {

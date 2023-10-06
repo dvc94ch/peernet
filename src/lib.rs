@@ -327,7 +327,9 @@ mod tests {
 
     async fn wait_for_resolve(endpoint: &Endpoint, peer_id: &PeerId) -> Result<PeerAddr> {
         loop {
-            let addr = endpoint.resolve(peer_id).await?;
+            let Ok(addr) = endpoint.resolve(peer_id).await else {
+                continue;
+            };
             if addr.info.direct_addresses.is_empty() {
                 log::info!("waiting for resolve");
                 tokio::time::sleep(Duration::from_secs(1)).await;

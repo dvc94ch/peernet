@@ -97,6 +97,12 @@ fn peer_addr_to_instance_info(addr: &PeerAddr) -> InstanceInformation {
         instance_info.ip_addresses.push(addr.ip());
         instance_info.ports.push(addr.port());
     }
+    let origin = pkarr::PublicKey::try_from(*addr.peer_id.as_bytes())
+        .unwrap()
+        .to_z32();
+    instance_info
+        .attributes
+        .insert("peer".into(), Some(origin.into()));
     instance_info
 }
 

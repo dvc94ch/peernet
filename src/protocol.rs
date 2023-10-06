@@ -4,6 +4,7 @@ use futures::channel::{mpsc, oneshot};
 use futures::{FutureExt, StreamExt};
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashMap;
+use std::io;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -16,37 +17,22 @@ pub trait Protocol: Send + Sync + 'static {
     type Response: Serialize + DeserializeOwned + Send + Sync + 'static;
 }
 
-async fn send_msg<T: Serialize>(tx: &mut SendStream, msg: &T) -> Result<()> {
-    let bytes = bincode::serialize(msg)?;
-    let len: u16 = bytes.len().try_into()?;
-    tx.write_u16(len).await?;
-    tx.write_all(&bytes).await?;
-    Ok(())
-}
-
-async fn recv_msg<T: DeserializeOwned>(rx: &mut RecvStream, buf: &mut Vec<u8>) -> Result<T> {
-    let len = rx.read_u16().await?;
-    buf.clear();
-    rx.take(len as _).read_to_end(buf).await?;
-    Ok(bincode::deserialize(&buf)?)
-}
-
-async fn send_one<P: Protocol>(tx: &mut SendStream, msg: &P::Request) -> Result<()> {
+async fn send_request<P: Protocol>(tx: &mut SendStream, req: &P::Request) -> Result<()> {
     tx.write_u16(P::ID).await?;
-    send_msg(tx, &msg).await?;
+    let bytes = bincode::serialize(req)?;
+    tx.write_all(&bytes).await?;
     tx.finish().await?;
     Ok(())
 }
 
-async fn recv_one<T: DeserializeOwned>(rx: &mut RecvStream, size: usize) -> Result<T> {
-    let mut buf = Vec::with_capacity(size);
-    recv_msg(rx, &mut buf).await
+async fn recv_request<P: Protocol>(rx: &mut RecvStream) -> Result<P::Request> {
+    let buf = rx.read_to_end(P::REQ_BUF).await?;
+    Ok(bincode::deserialize(&buf)?)
 }
 
-pub async fn notify<P: Protocol>(conn: &mut Connection, msg: &P::Request) -> Result<()> {
+pub async fn notify<P: Protocol>(conn: &mut Connection, req: &P::Request) -> Result<()> {
     let mut tx = conn.open_uni().await?;
-    send_one::<P>(&mut tx, msg).await?;
-    Ok(())
+    send_request::<P>(&mut tx, req).await
 }
 
 pub async fn request_response<P: Protocol>(
@@ -54,8 +40,9 @@ pub async fn request_response<P: Protocol>(
     req: &P::Request,
 ) -> Result<P::Response> {
     let (mut tx, mut rx) = conn.open_bi().await?;
-    send_one::<P>(&mut tx, req).await?;
-    recv_one(&mut rx, P::RES_BUF).await
+    send_request::<P>(&mut tx, req).await?;
+    let buf = rx.read_to_end(P::RES_BUF).await?;
+    Ok(bincode::deserialize(&buf)?)
 }
 
 pub async fn subscribe<P: Protocol>(
@@ -63,7 +50,7 @@ pub async fn subscribe<P: Protocol>(
     req: &P::Request,
 ) -> Result<Subscription<P::Response>> {
     let (mut tx, rx) = conn.open_bi().await?;
-    send_one::<P>(&mut tx, req).await?;
+    send_request::<P>(&mut tx, req).await?;
     Ok(Subscription::new(rx, P::RES_BUF))
 }
 
@@ -82,9 +69,23 @@ impl<T: DeserializeOwned> Subscription<T> {
         }
     }
 
-    pub async fn next(&mut self) -> Result<T> {
-        // TODO: handle eof
-        Ok(recv_msg(&mut self.rx, &mut self.buf).await?)
+    pub async fn next(&mut self) -> Result<Option<T>> {
+        let len = match self.rx.read_u16().await {
+            Ok(len) => len,
+            Err(err) => {
+                return if err.kind() == io::ErrorKind::UnexpectedEof {
+                    Ok(None)
+                } else {
+                    Err(err.into())
+                };
+            }
+        };
+        self.buf.clear();
+        (&mut self.rx)
+            .take(len as _)
+            .read_to_end(&mut self.buf)
+            .await?;
+        Ok(Some(bincode::deserialize(&self.buf)?))
     }
 }
 
@@ -140,7 +141,7 @@ where
     H: NotificationHandler<P>,
 {
     async fn handle(&self, peer_id: PeerId, mut rx: RecvStream) -> Result<()> {
-        let req = recv_one(&mut rx, P::REQ_BUF).await?;
+        let req = recv_request::<P>(&mut rx).await?;
         self.handler.notify(peer_id, req)?;
         Ok(())
     }
@@ -176,11 +177,12 @@ where
     H: RequestHandler<P>,
 {
     async fn handle(&self, peer_id: PeerId, mut rx: RecvStream, mut tx: SendStream) -> Result<()> {
-        let req = recv_one(&mut rx, P::REQ_BUF).await?;
+        let req = recv_request::<P>(&mut rx).await?;
         let (htx, hrx) = oneshot::channel();
         self.handler.request(peer_id, req, htx)?;
         let res = hrx.await?;
-        send_msg(&mut tx, &res).await?;
+        let bytes = bincode::serialize(&res)?;
+        tx.write_all(&bytes).await?;
         tx.finish().await?;
         Ok(())
     }
@@ -216,11 +218,13 @@ where
     H: SubscriptionHandler<P>,
 {
     async fn handle(&self, peer_id: PeerId, mut rx: RecvStream, mut tx: SendStream) -> Result<()> {
-        let req = recv_one(&mut rx, P::REQ_BUF).await?;
+        let req = recv_request::<P>(&mut rx).await?;
         let (htx, mut hrx) = mpsc::channel(1);
         self.handler.subscribe(peer_id, req, htx)?;
         while let Some(res) = hrx.next().await {
-            send_msg(&mut tx, &res).await?;
+            let bytes = bincode::serialize(&res)?;
+            tx.write_u16(bytes.len().try_into()?).await?;
+            tx.write_all(&bytes).await?;
         }
         tx.finish().await?;
         Ok(())

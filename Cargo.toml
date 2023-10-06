@@ -14,7 +14,9 @@ log = "0.4.20"
 pkarr = "0.1.3"
 quinn = "0.10.2"
 serde = "1.0.188"
+simple-mdns = { version = "0.4.2", features = ["async-tokio"] }
 tokio = "1.32.0"
+ttl_cache = "0.5.1"
 
 [dev-dependencies]
 env_logger = "0.10.0"

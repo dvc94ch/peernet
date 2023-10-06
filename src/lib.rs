@@ -1,57 +1,108 @@
 use anyhow::Result;
+use iroh_net::defaults::{default_derp_map, TEST_REGION_ID};
 use iroh_net::derp::{DerpMap, DerpMode};
 use iroh_net::key::SecretKey;
 use iroh_net::magic_endpoint::accept_conn;
-use iroh_net::{AddrInfo, MagicEndpoint, PeerAddr};
-use pkarr::dns::rdata::{RData, A, AAAA, TXT};
-use pkarr::dns::{Name, Packet, ResourceRecord, CLASS};
-use pkarr::{PkarrClient, SignedPacket, Url};
-use serde::{de::DeserializeOwned, Serialize};
-use std::collections::HashSet;
-use std::net::{IpAddr, SocketAddr};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use iroh_net::{MagicEndpoint, PeerAddr};
+use pkarr::url::Url;
+use pkarr::{PkarrClient, DEFAULT_PKARR_RELAY};
 
+mod dns;
+mod protocol;
+
+pub use crate::protocol::{
+    NotificationHandler, Protocol, ProtocolHandler, ProtocolHandlerBuilder, RequestHandler,
+    Subscription, SubscriptionHandler,
+};
 pub use quinn::{Connection, RecvStream, SendStream};
-
 pub type PeerId = iroh_net::key::PublicKey;
 
-const DERP_REGION_KEY: &str = "_derp_region.iroh.";
-
-#[allow(unused)]
-fn filter_ipaddr(rr: &ResourceRecord, name: &str) -> Option<IpAddr> {
-    if rr.name != Name::new(name).unwrap() || rr.class != CLASS::IN {
-        return None;
-    }
-    let addr: IpAddr = match rr.rdata {
-        RData::A(A { address }) => IpAddr::V4(address.into()),
-        RData::AAAA(AAAA { address }) => IpAddr::V6(address.into()),
-        _ => return None,
-    };
-    Some(addr)
+pub struct EndpointBuilder {
+    alpn: Vec<u8>,
+    handler: ProtocolHandler,
+    secret: Option<[u8; 32]>,
+    port: u16,
+    pkarr_relay: Option<Url>,
+    derp_map: Option<DerpMap>,
 }
 
-fn filter_txt<'a>(rr: &'a ResourceRecord, name: &str) -> Option<String> {
-    if rr.name != Name::new(name).unwrap() || rr.class != CLASS::IN {
-        return None;
+impl EndpointBuilder {
+    pub fn new(alpn: Vec<u8>, handler: ProtocolHandler) -> Self {
+        Self {
+            alpn,
+            handler,
+            secret: None,
+            port: 0,
+            pkarr_relay: None,
+            derp_map: None,
+        }
     }
-    if let RData::TXT(txt) = &rr.rdata {
-        String::try_from(txt.clone()).ok()
-    } else {
-        None
+
+    pub fn secret(&mut self, secret: [u8; 32]) -> &mut Self {
+        self.secret = Some(secret);
+        self
+    }
+
+    pub fn port(&mut self, port: u16) -> &mut Self {
+        self.port = port;
+        self
+    }
+
+    pub fn relay(&mut self, relay: Url) -> &mut Self {
+        self.pkarr_relay = Some(relay);
+        self
+    }
+
+    pub fn localhost_relay(&mut self) -> &mut Self {
+        self.pkarr_relay = Some("http://127.0.0.1:6881".parse().unwrap());
+        self
+    }
+
+    pub fn pkarr_relay(&mut self) -> &mut Self {
+        self.pkarr_relay = Some(DEFAULT_PKARR_RELAY.parse().unwrap());
+        self
+    }
+
+    pub fn derp_map(&mut self, map: DerpMap) -> &mut Self {
+        self.derp_map = Some(map);
+        self
+    }
+
+    pub fn localhost_derp_map(&mut self) -> &mut Self {
+        self.derp_map = Some(DerpMap::from_url(
+            "http://127.0.0.1:3340".parse().unwrap(),
+            TEST_REGION_ID,
+        ));
+        self
+    }
+
+    pub fn iroh_derp_map(&mut self) -> &mut Self {
+        self.derp_map = Some(default_derp_map());
+        self
+    }
+
+    pub async fn build(self) -> Result<Endpoint> {
+        let secret = self.secret.unwrap_or_else(|| {
+            let mut secret = [0; 32];
+            getrandom::getrandom(&mut secret).unwrap();
+            secret
+        });
+        let relay = self
+            .pkarr_relay
+            .unwrap_or_else(|| "http://127.0.0.1:6881".parse().unwrap());
+        Endpoint::new(
+            secret,
+            self.alpn,
+            self.port,
+            relay,
+            self.derp_map,
+            self.handler,
+        )
+        .await
     }
 }
 
-fn filter_u16(rr: &ResourceRecord, name: &str) -> Option<u16> {
-    if rr.name != Name::new(name).unwrap() || rr.class != CLASS::IN {
-        return None;
-    }
-    if let RData::A(A { address }) = rr.rdata {
-        Some(address as _)
-    } else {
-        None
-    }
-}
-
+#[derive(Clone)]
 pub struct Endpoint {
     secret: [u8; 32],
     alpn: Vec<u8>,
@@ -61,27 +112,32 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-    pub async fn new(
+    pub fn builder(alpn: Vec<u8>, handler: ProtocolHandler) -> EndpointBuilder {
+        EndpointBuilder::new(alpn, handler)
+    }
+
+    async fn new(
         secret: [u8; 32],
-        alpn: &[u8],
+        alpn: Vec<u8>,
         port: u16,
-        pkarr_relay: &str,
+        pkarr_relay: Url,
         derp_map: Option<DerpMap>,
+        handler: ProtocolHandler,
     ) -> Result<Self> {
         let pkarr = PkarrClient::new();
-        let pkarr_relay = pkarr_relay.parse()?;
         let builder = MagicEndpoint::builder()
             .secret_key(SecretKey::from(secret))
-            .alpns(vec![alpn.to_vec()]);
+            .alpns(vec![alpn.clone()]);
         let builder = if let Some(derp_map) = derp_map {
             builder.derp_mode(DerpMode::Custom(derp_map))
         } else {
             builder.derp_mode(DerpMode::Disabled)
         };
         let endpoint = builder.bind(port).await?;
+        tokio::spawn(server(endpoint.clone(), handler));
         Ok(Self {
             secret,
-            alpn: alpn.to_vec(),
+            alpn,
             endpoint,
             pkarr_relay,
             pkarr,
@@ -92,7 +148,13 @@ impl Endpoint {
         self.endpoint.peer_id()
     }
 
-    pub async fn resolve(&self, peer_id: &PeerId) -> Result<PeerAddr> {
+    pub async fn addr(&self) -> Result<PeerAddr> {
+        Ok(self.endpoint.my_addr().await?)
+    }
+
+    // TODO: cache peer addresses
+    // TODO: support mdns
+    async fn resolve(&self, peer_id: &PeerId) -> Result<PeerAddr> {
         let msg = self
             .pkarr
             .relay_get(
@@ -100,147 +162,149 @@ impl Endpoint {
                 pkarr::PublicKey::try_from(*peer_id.as_bytes()).unwrap(),
             )
             .await?;
-        let packet = msg.packet()?;
-        let direct_addresses = packet
-            .answers
-            .iter()
-            .filter_map(|rr| filter_txt(rr, "@"))
-            .filter_map(|addr| addr.parse().ok())
-            .collect::<HashSet<SocketAddr>>();
-        let derp_region = packet
-            .answers
-            .iter()
-            .find_map(|rr| filter_u16(rr, DERP_REGION_KEY));
-        Ok(PeerAddr {
-            peer_id: *peer_id,
-            info: AddrInfo {
-                derp_region,
-                direct_addresses,
-            },
-        })
+        Ok(crate::dns::packet_to_peer_addr(peer_id, &msg))
     }
 
+    // TODO: once the socket support notifying address changes we can handle publishing
+    // automatically and make this private
+    // TODO: support mdns
     pub async fn publish(&self) -> Result<()> {
-        let addr = self.endpoint.my_addr().await?;
-        let mut packet = Packet::new_reply(0);
-        for addr in addr.info.direct_addresses {
-            let addr = addr.to_string();
-            packet.answers.push(ResourceRecord::new(
-                Name::new("@").unwrap(),
-                CLASS::IN,
-                30,
-                RData::TXT(TXT::try_from(addr.as_str())?.into_owned()),
-            ));
-        }
-        if let Some(derp_region) = addr.info.derp_region {
-            packet.answers.push(ResourceRecord::new(
-                Name::new(DERP_REGION_KEY).unwrap(),
-                CLASS::IN,
-                30,
-                RData::A(A {
-                    address: derp_region as _,
-                }),
-            ));
-        }
-        let keypair = pkarr::Keypair::from_secret_key(&self.secret);
-        let packet = SignedPacket::from_packet(&keypair, &packet)?;
+        let addr = self.addr().await?;
+        let packet = crate::dns::peer_addr_to_packet(&self.secret, &addr)?;
         self.pkarr.relay_put(&self.pkarr_relay, packet).await?;
         Ok(())
     }
 
-    pub async fn connect(&self, addr: PeerAddr) -> Result<Connection> {
+    pub async fn connect(&self, peer_id: &PeerId) -> Result<Connection> {
+        let addr = self.resolve(peer_id).await?;
         Ok(self.endpoint.connect(addr, &self.alpn).await?)
     }
 
-    pub async fn accept(&self) -> Result<Connection> {
-        let Some(conn) = self.endpoint.accept().await else {
-            anyhow::bail!("socket closed");
-        };
-        let (_peer_id, alpn, conn) = accept_conn(conn).await?;
-        if self.alpn != alpn.as_bytes() {
-            anyhow::bail!("unexpected alpn {}", alpn);
-        }
-        Ok(conn)
+    pub async fn notify<P: Protocol>(&self, peer_id: &PeerId, msg: &P::Request) -> Result<()> {
+        let mut conn = self.connect(peer_id).await?;
+        crate::protocol::notify::<P>(&mut conn, msg).await
+    }
+
+    pub async fn request<P: Protocol>(
+        &self,
+        peer_id: &PeerId,
+        msg: &P::Request,
+    ) -> Result<P::Response> {
+        let mut conn = self.connect(peer_id).await?;
+        crate::protocol::request_response::<P>(&mut conn, msg).await
+    }
+
+    pub async fn subscribe<P: Protocol>(
+        &self,
+        peer_id: &PeerId,
+        msg: &P::Request,
+    ) -> Result<Subscription<P::Response>> {
+        let mut conn = self.connect(peer_id).await?;
+        crate::protocol::subscribe::<P>(&mut conn, msg).await
     }
 }
 
-pub async fn send_one<T: Serialize>(tx: &mut SendStream, msg: &T) -> Result<()> {
-    let bytes = bincode::serialize(msg)?;
-    let len: u16 = bytes.len().try_into()?;
-    tx.write_u16(len).await?;
-    tx.write_all(&bytes).await?;
-    Ok(())
-}
-
-pub async fn recv_one<T: DeserializeOwned>(rx: &mut RecvStream, buf: &mut Vec<u8>) -> Result<T> {
-    let len = rx.read_u16().await?;
-    buf.clear();
-    rx.take(len as _).read_to_end(buf).await?;
-    Ok(bincode::deserialize(&buf)?)
+async fn server(endpoint: MagicEndpoint, handler: ProtocolHandler) {
+    loop {
+        let Some(conn) = endpoint.accept().await else {
+            log::info!("socket closed");
+            break;
+        };
+        match accept_conn(conn).await {
+            Ok((peer_id, _alpn, conn)) => {
+                handler.handle(peer_id, conn);
+            }
+            Err(err) => {
+                dbg!(err);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iroh_net::defaults::TEST_REGION_ID;
+    use futures::channel::oneshot;
     use serde::{Deserialize, Serialize};
     use std::time::Duration;
 
     const ALPN: &[u8] = b"/analog/tss/1";
-    const PKARR_RELAY: &str = "http://127.0.0.1:6881";
-    const PORT: u16 = 33000;
 
     #[derive(Deserialize, Serialize)]
-    struct Ping(u16);
+    pub struct Ping(u16);
 
     #[derive(Deserialize, Serialize)]
-    struct Pong(u16);
+    pub struct Pong(u16);
 
-    async fn ping(conn: &mut Connection) -> Result<Pong> {
-        let (mut tx, mut rx) = conn.open_bi().await?;
-        let mut buf = Vec::with_capacity(1024);
-        send_one(&mut tx, &Ping(42)).await?;
-        tx.finish().await?;
-        Ok(recv_one(&mut rx, &mut buf).await?)
+    pub struct PingPong;
+
+    impl Protocol for PingPong {
+        const ID: u16 = 0;
+        const REQ_BUF: usize = 1024;
+        const RES_BUF: usize = 1024;
+        type Request = Ping;
+        type Response = Pong;
     }
 
-    async fn pong(conn: &mut Connection) -> Result<()> {
-        let (mut tx, mut rx) = conn.accept_bi().await?;
-        let mut buf = Vec::with_capacity(1024);
-        let ping: Ping = recv_one(&mut rx, &mut buf).await?;
-        send_one(&mut tx, &Pong(ping.0)).await?;
-        tx.finish().await?;
-        Ok(())
+    impl RequestHandler<Self> for PingPong {
+        fn request(
+            &self,
+            _peer_id: PeerId,
+            request: <Self as Protocol>::Request,
+            response: oneshot::Sender<<Self as Protocol>::Response>,
+        ) -> Result<()> {
+            response
+                .send(Pong(request.0))
+                .map_err(|_| anyhow::anyhow!("response channel closed"))?;
+            Ok(())
+        }
     }
 
     #[tokio::test]
-    async fn smoke() -> Result<()> {
+    async fn request_response() -> Result<()> {
         env_logger::try_init().ok();
-        log::info!("starting test");
-        let derp_map = DerpMap::from_url("http://127.0.0.1:3340".parse().unwrap(), TEST_REGION_ID);
-        let e1 = Endpoint::new([1; 32], ALPN, PORT, PKARR_RELAY, Some(derp_map.clone())).await?;
-        let e2 =
-            Endpoint::new([2; 32], ALPN, PORT + 1, PKARR_RELAY, Some(derp_map.clone())).await?;
-        let p1 = e1.peer_id();
+
+        let mut builder = ProtocolHandler::builder();
+        builder.register_request_handler(PingPong);
+        let handler = builder.build();
+
+        let mut builder = Endpoint::builder(ALPN.to_vec(), handler.clone());
+        builder.localhost_relay();
+        builder.localhost_derp_map();
+        let e1 = builder.build().await?;
+
+        let mut builder = Endpoint::builder(ALPN.to_vec(), handler);
+        builder.localhost_relay();
+        builder.localhost_derp_map();
+        let e2 = builder.build().await?;
         log::info!("created endpoints");
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        e1.publish().await.unwrap();
-        log::info!("published record");
-        tokio::spawn(async move {
-            loop {
-                if let Ok(mut conn) = e1.accept().await {
-                    log::info!("accepted connection");
-                    tokio::spawn(async move { dbg!(pong(&mut conn).await) });
-                }
+
+        let p1 = e1.peer_id();
+        loop {
+            let addr = e1.addr().await?;
+            if addr.info.direct_addresses.is_empty() {
+                log::info!("waiting for addr");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
             }
-        });
-        let addr = e2.resolve(&p1).await?;
-        log::info!("resolved record {:?}", addr);
-        let mut conn = e2.connect(addr).await?;
-        log::info!("connected");
-        let pong = ping(&mut conn).await?;
-        log::info!("response");
-        assert_eq!(pong.0, 42);
+            log::info!("publishing {:?}", addr);
+            e1.publish().await?;
+            break;
+        }
+        log::info!("published record");
+
+        loop {
+            let addr = e2.resolve(&p1).await?;
+            if addr.info.direct_addresses.is_empty() {
+                log::info!("waiting for addr");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            log::info!("resolved {:?}", addr);
+            let pong = e2.request::<PingPong>(&p1, &Ping(42)).await?;
+            assert_eq!(pong.0, 42);
+            break;
+        }
         Ok(())
     }
 }

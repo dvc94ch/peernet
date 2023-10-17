@@ -6,7 +6,7 @@ use pkarr::dns::{Name, Packet, ResourceRecord, CLASS};
 use pkarr::url::Url;
 use pkarr::{Keypair, PkarrClient, SignedPacket};
 use simple_mdns::async_discovery::ServiceDiscovery;
-use simple_mdns::InstanceInformation;
+use simple_mdns::{InstanceInformation, NetworkScope};
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -97,12 +97,6 @@ fn peer_addr_to_instance_info(addr: &PeerAddr) -> InstanceInformation {
         instance_info.ip_addresses.push(addr.ip());
         instance_info.ports.push(addr.port());
     }
-    let origin = pkarr::PublicKey::try_from(*addr.peer_id.as_bytes())
-        .unwrap()
-        .to_z32();
-    instance_info
-        .attributes
-        .insert("peer".into(), Some(origin.into()));
     instance_info
 }
 
@@ -130,7 +124,13 @@ impl Discovery {
         let keypair = Keypair::from_secret_key(&secret);
         let origin = keypair.public_key().to_z32();
         let mdns = if mdns {
-            Some(ServiceDiscovery::new(&origin, "_pkarr.local", ttl)?)
+            Some(ServiceDiscovery::new_with_scope(
+                &origin,
+                "_pkarr.local",
+                ttl,
+                None,
+                NetworkScope::V4,
+            )?)
         } else {
             None
         };
@@ -159,14 +159,14 @@ impl Discovery {
             return Ok(addr.clone());
         }
         let origin = pkarr::PublicKey::try_from(*peer_id.as_bytes()).unwrap();
-        let origin_z32 = Some(origin.to_z32());
+        let origin_z32 = origin.to_z32();
         if let Some(mdns) = self.mdns.as_ref() {
             if let Some(addr) = mdns
                 .get_known_services()
                 .await
                 .into_iter()
-                .find(|instance_info| instance_info.attributes.get("peer") == Some(&origin_z32))
-                .map(|instance_info| instance_info_to_peer_addr(peer_id, &instance_info))
+                .find(|(peer, _)| peer == &origin_z32)
+                .map(|(_, instance_info)| instance_info_to_peer_addr(peer_id, &instance_info))
             {
                 self.add_address(addr.clone());
                 return Ok(addr);

@@ -11,10 +11,10 @@ futures = "0.3.28"
 getrandom = "0.2.10"
 iroh-net = { git = "https://github.com/n0-computer/iroh" }
 log = "0.4.20"
-pkarr = { git = "https://github.com/dvc94ch/pkarr", branch = "rm-openssl" }
+pkarr = "0.3.0"
 quinn = "0.10.2"
 serde = "1.0.188"
-simple-mdns = { git = "https://github.com/balliegojr/simple-dns", features = ["async-tokio"] }
+simple-mdns = { version = "0.5.0", features = ["async-tokio"] }
 tokio = "1.32.0"
 ttl_cache = "0.5.1"
 

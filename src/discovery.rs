@@ -101,7 +101,13 @@ struct InnerDiscovery {
 }
 
 impl InnerDiscovery {
-    pub fn new(secret: [u8; 32], relay: Option<Url>, mdns: bool, ttl: u32) -> Result<Self> {
+    pub fn new(
+        secret: [u8; 32],
+        relay: Option<Url>,
+        dht: bool,
+        mdns: bool,
+        ttl: u32,
+    ) -> Result<Self> {
         let keypair = Keypair::from_secret_key(&secret);
         let origin = keypair.public_key().to_z32();
         let mdns = if mdns {
@@ -115,7 +121,7 @@ impl InnerDiscovery {
         } else {
             None
         };
-        let pkarr = if relay.is_some() {
+        let pkarr = if dht || relay.is_some() {
             Some(PkarrClient::new())
         } else {
             None
@@ -147,11 +153,17 @@ impl InnerDiscovery {
                 return Ok(addr);
             }
         }
-        if let (Some(pkarr), Some(url)) = (self.pkarr.as_ref(), self.relay.as_ref()) {
-            let msg = pkarr.relay_get(url, origin).await?;
-            let addr = packet_to_peer_addr(&msg);
-            tracing::info!("resolved: {} to {:?} via {}", peer_id, addr, url);
-            return Ok(addr);
+        if let Some(pkarr) = self.pkarr.as_ref() {
+            let msg = if let Some(relay) = self.relay.as_ref() {
+                Some(pkarr.relay_get(relay, origin).await?)
+            } else {
+                pkarr.resolve(origin).await
+            };
+            if let Some(msg) = msg {
+                let addr = packet_to_peer_addr(&msg);
+                tracing::info!("resolved: {} to {:?}", peer_id, addr);
+                return Ok(addr);
+            }
         }
         anyhow::bail!("peer not found");
     }
@@ -162,9 +174,14 @@ impl InnerDiscovery {
         if let Some(mdns) = self.mdns.as_ref() {
             mdns.write().await.add_service_info(instance_info).await?;
         }
-        if let (Some(pkarr), Some(url)) = (self.pkarr.as_ref(), self.relay.as_ref()) {
-            tracing::info!("publishing {:?} via {}", addr, url);
-            pkarr.relay_put(url, packet).await?;
+        if let Some(pkarr) = self.pkarr.as_ref() {
+            if let Some(relay) = self.relay.as_ref() {
+                tracing::info!("publishing {:?} via relay {}", addr, relay);
+                pkarr.relay_put(relay, packet).await?;
+            } else {
+                tracing::info!("publishing {:?} via dht", addr);
+                pkarr.publish(&packet).await?;
+            }
         }
         Ok(())
     }
@@ -180,9 +197,15 @@ impl std::fmt::Debug for Discovery {
 }
 
 impl Discovery {
-    pub fn new(secret: [u8; 32], relay: Option<Url>, mdns: bool, ttl: u32) -> Result<Self> {
+    pub fn new(
+        secret: [u8; 32],
+        relay: Option<Url>,
+        dht: bool,
+        mdns: bool,
+        ttl: u32,
+    ) -> Result<Self> {
         Ok(Self(Arc::new(InnerDiscovery::new(
-            secret, relay, mdns, ttl,
+            secret, relay, dht, mdns, ttl,
         )?)))
     }
 

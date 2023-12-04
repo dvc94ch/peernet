@@ -4,7 +4,7 @@ use iroh_net::defaults::{default_derp_map, TEST_REGION_ID};
 use iroh_net::derp::{DerpMap, DerpMode};
 use iroh_net::key::SecretKey;
 use iroh_net::magic_endpoint::accept_conn;
-use iroh_net::{MagicEndpoint, PeerAddr};
+use iroh_net::{MagicEndpoint, NodeAddr};
 use pkarr::url::Url;
 use pkarr::DEFAULT_PKARR_RELAY;
 use std::time::Duration;
@@ -27,6 +27,7 @@ pub struct EndpointBuilder {
     pkarr_relay: Option<Url>,
     derp_map: Option<DerpMap>,
     ttl: Option<u32>,
+    enable_dht: bool,
     enable_mdns: bool,
     republish: bool,
 }
@@ -41,6 +42,7 @@ impl EndpointBuilder {
             pkarr_relay: None,
             derp_map: None,
             ttl: None,
+            enable_dht: false,
             enable_mdns: false,
             republish: true,
         }
@@ -90,6 +92,11 @@ impl EndpointBuilder {
         self.derp_map(default_derp_map())
     }
 
+    pub fn enable_dht(&mut self) -> &mut Self {
+        self.enable_dht = true;
+        self
+    }
+
     pub fn enable_mdns(&mut self) -> &mut Self {
         self.enable_mdns = true;
         self
@@ -121,6 +128,7 @@ impl EndpointBuilder {
             self.derp_map,
             self.handler,
             ttl,
+            self.enable_dht,
             self.enable_mdns,
         )
         .await
@@ -147,9 +155,10 @@ impl Endpoint {
         derp_map: Option<DerpMap>,
         handler: Option<ProtocolHandler>,
         ttl: u32,
+        enable_dht: bool,
         enable_mdns: bool,
     ) -> Result<Self> {
-        let discovery = Discovery::new(secret, relay, enable_mdns, ttl)?;
+        let discovery = Discovery::new(secret, relay, enable_dht, enable_mdns, ttl)?;
         let builder = MagicEndpoint::builder()
             .secret_key(SecretKey::from(secret))
             .alpns(vec![alpn.clone()])
@@ -171,15 +180,15 @@ impl Endpoint {
     }
 
     pub fn peer_id(&self) -> PeerId {
-        self.endpoint.peer_id()
+        self.endpoint.node_id()
     }
 
-    pub async fn addr(&self) -> Result<PeerAddr> {
+    pub async fn addr(&self) -> Result<NodeAddr> {
         Ok(self.endpoint.my_addr().await?)
     }
 
-    pub async fn add_address(&self, address: PeerAddr) -> Result<()> {
-        self.endpoint.add_peer_addr(address).await?;
+    pub fn add_address(&self, address: NodeAddr) -> Result<()> {
+        self.endpoint.add_node_addr(address)?;
         Ok(())
     }
 
@@ -333,7 +342,7 @@ mod tests {
         }
     }
 
-    async fn wait_for_publish(endpoint: &Endpoint) -> Result<PeerAddr> {
+    async fn wait_for_publish(endpoint: &Endpoint) -> Result<NodeAddr> {
         loop {
             let addr = endpoint.addr().await?;
             if addr.info.direct_addresses.is_empty() {
@@ -386,12 +395,12 @@ mod tests {
         env_logger::try_init().ok();
 
         let mut builder = Endpoint::builder(ALPN.to_vec());
-        builder.localhost_relay();
+        builder.enable_dht();
         let e1 = builder.build().await?;
         let p1 = e1.peer_id();
 
         let mut builder = Endpoint::builder(ALPN.to_vec());
-        builder.localhost_relay();
+        builder.enable_dht();
         let e2 = builder.build().await?;
 
         let a1_2 = wait_for_resolve(&e2, &p1).await?;
@@ -421,7 +430,7 @@ mod tests {
 
         let a1 = wait_for_publish(&e1).await?;
 
-        e2.add_address(a1).await?;
+        e2.add_address(a1)?;
         e2.notify::<PingPong>(&p1, &Ping(42)).await?;
         let ping = rx.await?;
         assert_eq!(ping.0, 42);
@@ -446,7 +455,7 @@ mod tests {
 
         let a1 = wait_for_publish(&e1).await?;
 
-        e2.add_address(a1).await?;
+        e2.add_address(a1)?;
         let pong = e2.request::<PingPong>(&p1, &Ping(42)).await?;
         assert_eq!(pong.0, 42);
         Ok(())
@@ -470,7 +479,7 @@ mod tests {
 
         let a1 = wait_for_publish(&e1).await?;
 
-        e2.add_address(a1).await?;
+        e2.add_address(a1)?;
         let mut subscription = e2.subscribe::<PingPong>(&p1, &Ping(42)).await?;
         while let Some(pong) = subscription.next().await? {
             assert_eq!(pong.0, 42);

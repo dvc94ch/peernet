@@ -4,11 +4,10 @@ use iroh_net::defaults::{default_derp_map, TEST_REGION_ID};
 use iroh_net::derp::{DerpMap, DerpMode};
 use iroh_net::key::SecretKey;
 use iroh_net::magic_endpoint::accept_conn;
-use iroh_net::{MagicEndpoint, PeerAddr};
+use iroh_net::{MagicEndpoint, NodeAddr};
 use pkarr::url::Url;
 use pkarr::DEFAULT_PKARR_RELAY;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::time::Duration;
 
 mod discovery;
 mod protocol;
@@ -28,7 +27,9 @@ pub struct EndpointBuilder {
     pkarr_relay: Option<Url>,
     derp_map: Option<DerpMap>,
     ttl: Option<u32>,
+    enable_dht: bool,
     enable_mdns: bool,
+    republish: bool,
 }
 
 impl EndpointBuilder {
@@ -41,7 +42,9 @@ impl EndpointBuilder {
             pkarr_relay: None,
             derp_map: None,
             ttl: None,
+            enable_dht: false,
             enable_mdns: false,
+            republish: true,
         }
     }
 
@@ -66,13 +69,11 @@ impl EndpointBuilder {
     }
 
     pub fn localhost_relay(&mut self) -> &mut Self {
-        self.pkarr_relay = Some("http://127.0.0.1:6881".parse().unwrap());
-        self
+        self.relay("http://127.0.0.1:6881".parse().unwrap())
     }
 
     pub fn pkarr_relay(&mut self) -> &mut Self {
-        self.pkarr_relay = Some(DEFAULT_PKARR_RELAY.parse().unwrap());
-        self
+        self.relay(DEFAULT_PKARR_RELAY.parse().unwrap())
     }
 
     pub fn derp_map(&mut self, map: DerpMap) -> &mut Self {
@@ -81,20 +82,28 @@ impl EndpointBuilder {
     }
 
     pub fn localhost_derp_map(&mut self) -> &mut Self {
-        self.derp_map = Some(DerpMap::from_url(
+        self.derp_map(DerpMap::from_url(
             "http://127.0.0.1:3340".parse().unwrap(),
             TEST_REGION_ID,
-        ));
-        self
+        ))
     }
 
     pub fn iroh_derp_map(&mut self) -> &mut Self {
-        self.derp_map = Some(default_derp_map());
+        self.derp_map(default_derp_map())
+    }
+
+    pub fn enable_dht(&mut self) -> &mut Self {
+        self.enable_dht = true;
         self
     }
 
     pub fn enable_mdns(&mut self) -> &mut Self {
         self.enable_mdns = true;
+        self
+    }
+
+    pub fn republish(&mut self, republish: bool) -> &mut Self {
+        self.republish = republish;
         self
     }
 
@@ -115,9 +124,11 @@ impl EndpointBuilder {
             self.alpn,
             self.port,
             self.pkarr_relay,
+            self.republish,
             self.derp_map,
             self.handler,
             ttl,
+            self.enable_dht,
             self.enable_mdns,
         )
         .await
@@ -128,7 +139,6 @@ impl EndpointBuilder {
 pub struct Endpoint {
     alpn: Vec<u8>,
     endpoint: MagicEndpoint,
-    discovery: Arc<Mutex<Discovery>>,
 }
 
 impl Endpoint {
@@ -141,57 +151,56 @@ impl Endpoint {
         alpn: Vec<u8>,
         port: u16,
         relay: Option<Url>,
+        republish: bool,
         derp_map: Option<DerpMap>,
         handler: Option<ProtocolHandler>,
         ttl: u32,
+        enable_dht: bool,
         enable_mdns: bool,
     ) -> Result<Self> {
+        let discovery = Discovery::new(secret, relay, enable_dht, enable_mdns, ttl)?;
         let builder = MagicEndpoint::builder()
             .secret_key(SecretKey::from(secret))
-            .alpns(vec![alpn.clone()]);
+            .alpns(vec![alpn.clone()])
+            .discovery(Box::new(discovery));
         let builder = if let Some(derp_map) = derp_map {
             builder.derp_mode(DerpMode::Custom(derp_map))
         } else {
             builder.derp_mode(DerpMode::Disabled)
         };
         let endpoint = builder.bind(port).await?;
-        let discovery = Arc::new(Mutex::new(Discovery::new(secret, relay, enable_mdns, ttl)?));
         if let Some(handler) = handler {
             tokio::spawn(server(endpoint.clone(), handler));
         }
-        Ok(Self {
-            alpn,
-            endpoint,
-            discovery,
-        })
+        if republish {
+            tokio::spawn(republisher(endpoint.clone(), ttl));
+        }
+
+        Ok(Self { alpn, endpoint })
     }
 
     pub fn peer_id(&self) -> PeerId {
-        self.endpoint.peer_id()
+        self.endpoint.node_id()
     }
 
-    pub async fn addr(&self) -> Result<PeerAddr> {
+    pub async fn addr(&self) -> Result<NodeAddr> {
         Ok(self.endpoint.my_addr().await?)
     }
 
-    pub async fn add_address(&self, address: PeerAddr) {
-        self.discovery.lock().await.add_address(address);
+    pub fn add_address(&self, address: NodeAddr) -> Result<()> {
+        self.endpoint.add_node_addr(address)?;
+        Ok(())
     }
 
-    async fn resolve(&self, peer_id: &PeerId) -> Result<PeerAddr> {
-        self.discovery.lock().await.resolve(peer_id).await
-    }
-
-    // TODO: once the socket support notifying address changes we can handle publishing
-    // automatically and make this private
-    pub async fn publish(&self) -> Result<()> {
-        let addr = self.addr().await?;
-        self.discovery.lock().await.publish(&addr).await
+    pub fn discovery(&self) -> &dyn iroh_net::magicsock::Discovery {
+        self.endpoint.discovery().unwrap()
     }
 
     pub async fn connect(&self, peer_id: &PeerId) -> Result<Connection> {
-        let addr = self.resolve(peer_id).await?;
-        Ok(self.endpoint.connect(addr, &self.alpn).await?)
+        Ok(self
+            .endpoint
+            .connect_by_node_id(peer_id, &self.alpn)
+            .await?)
     }
 
     pub async fn notify<P: Protocol>(&self, peer_id: &PeerId, msg: &P::Request) -> Result<()> {
@@ -221,7 +230,7 @@ impl Endpoint {
 async fn server(endpoint: MagicEndpoint, handler: ProtocolHandler) {
     loop {
         let Some(conn) = endpoint.accept().await else {
-            log::info!("socket closed");
+            tracing::info!("socket closed");
             break;
         };
         match accept_conn(conn).await {
@@ -231,6 +240,26 @@ async fn server(endpoint: MagicEndpoint, handler: ProtocolHandler) {
             Err(err) => {
                 dbg!(err);
             }
+        }
+    }
+}
+
+async fn republisher(endpoint: MagicEndpoint, period: u32) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(period as _)).await;
+        let addr = match endpoint.my_addr().await {
+            Ok(addr) => addr,
+            Err(err) => {
+                dbg!(err);
+                continue;
+            }
+        };
+        if addr.info.direct_addresses.is_empty() {
+            continue;
+        }
+        if let Some(discovery) = endpoint.discovery() {
+            tracing::info!("republishing");
+            discovery.publish(&addr.info);
         }
     }
 }
@@ -313,11 +342,11 @@ mod tests {
         }
     }
 
-    async fn wait_for_publish(endpoint: &Endpoint) -> Result<PeerAddr> {
+    async fn wait_for_publish(endpoint: &Endpoint) -> Result<NodeAddr> {
         loop {
             let addr = endpoint.addr().await?;
             if addr.info.direct_addresses.is_empty() {
-                log::info!("waiting for publish");
+                tracing::info!("waiting for publish");
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
@@ -325,13 +354,14 @@ mod tests {
         }
     }
 
-    async fn wait_for_resolve(endpoint: &Endpoint, peer_id: &PeerId) -> Result<PeerAddr> {
+    async fn wait_for_resolve(endpoint: &Endpoint, peer_id: &PeerId) -> Result<iroh_net::AddrInfo> {
         loop {
-            let Ok(addr) = endpoint.resolve(peer_id).await else {
+            let Ok(addr) = endpoint.discovery().resolve(peer_id).await else {
+                tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             };
-            if addr.info.direct_addresses.is_empty() {
-                log::info!("waiting for resolve");
+            if addr.direct_addresses.is_empty() {
+                tracing::info!("waiting for resolve");
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
@@ -352,15 +382,11 @@ mod tests {
         builder.enable_mdns();
         let e2 = builder.build().await?;
 
-        let a1 = wait_for_publish(&e1).await?;
-        log::info!("publishing {:?}", a1);
-        e1.publish().await?;
-        log::info!("published record");
-
         let a1_2 = wait_for_resolve(&e2, &p1).await?;
-        log::info!("resolved {:?}", a1_2);
+        tracing::info!("resolved {:?}", a1_2);
 
-        assert_eq!(a1, a1_2);
+        let a1 = e1.addr().await?;
+        assert_eq!(a1.info, a1_2);
         Ok(())
     }
 
@@ -369,23 +395,19 @@ mod tests {
         env_logger::try_init().ok();
 
         let mut builder = Endpoint::builder(ALPN.to_vec());
-        builder.localhost_relay();
+        builder.enable_dht();
         let e1 = builder.build().await?;
         let p1 = e1.peer_id();
 
         let mut builder = Endpoint::builder(ALPN.to_vec());
-        builder.localhost_relay();
+        builder.enable_dht();
         let e2 = builder.build().await?;
 
-        let a1 = wait_for_publish(&e1).await?;
-        log::info!("publishing {:?}", a1);
-        e1.publish().await?;
-        log::info!("published record");
-
         let a1_2 = wait_for_resolve(&e2, &p1).await?;
-        log::info!("resolved {:?}", a1_2);
+        tracing::info!("resolved {:?}", a1_2);
 
-        assert_eq!(a1, a1_2);
+        let a1 = e1.addr().await?;
+        assert_eq!(a1.info, a1_2);
         Ok(())
     }
 
@@ -408,7 +430,7 @@ mod tests {
 
         let a1 = wait_for_publish(&e1).await?;
 
-        e2.add_address(a1).await;
+        e2.add_address(a1)?;
         e2.notify::<PingPong>(&p1, &Ping(42)).await?;
         let ping = rx.await?;
         assert_eq!(ping.0, 42);
@@ -433,7 +455,7 @@ mod tests {
 
         let a1 = wait_for_publish(&e1).await?;
 
-        e2.add_address(a1).await;
+        e2.add_address(a1)?;
         let pong = e2.request::<PingPong>(&p1, &Ping(42)).await?;
         assert_eq!(pong.0, 42);
         Ok(())
@@ -457,7 +479,7 @@ mod tests {
 
         let a1 = wait_for_publish(&e1).await?;
 
-        e2.add_address(a1).await;
+        e2.add_address(a1)?;
         let mut subscription = e2.subscribe::<PingPong>(&p1, &Ping(42)).await?;
         while let Some(pong) = subscription.next().await? {
             assert_eq!(pong.0, 42);

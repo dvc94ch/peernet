@@ -1,7 +1,10 @@
 [package]
-name = "p2p"
+name = "peernet"
 version = "0.1.0"
 edition = "2021"
+description = "easy and reliable p2p networking"
+repository = "https://github.com/dvc94ch/peernet"
+license = "Apache-2.0 OR MIT"
 
 [dependencies]
 anyhow = "1.0.75"

@@ -155,7 +155,7 @@ impl InnerDiscovery {
         }
         if let Some(pkarr) = self.pkarr.as_ref() {
             let msg = if let Some(relay) = self.relay.as_ref() {
-                Some(pkarr.relay_get(relay, origin).await?)
+                pkarr.relay_get(relay, origin).await?
             } else {
                 pkarr.resolve(origin).await
             };
@@ -177,7 +177,7 @@ impl InnerDiscovery {
         if let Some(pkarr) = self.pkarr.as_ref() {
             if let Some(relay) = self.relay.as_ref() {
                 tracing::info!("publishing {:?} via relay {}", addr, relay);
-                pkarr.relay_put(relay, packet).await?;
+                pkarr.relay_put(relay, &packet).await?;
             } else {
                 tracing::info!("publishing {:?} via dht", addr);
                 pkarr.publish(&packet).await?;

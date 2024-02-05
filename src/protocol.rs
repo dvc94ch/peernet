@@ -280,40 +280,42 @@ impl ProtocolHandler {
 
     pub fn handle(&self, peer_id: PeerId, conn: Connection) {
         let handler = self.0.clone();
+        let conn2 = conn.clone();
         tokio::spawn(async move {
             loop {
-                futures::select! {
-                    uni = conn.accept_uni().fuse() => {
-                        let rx = match uni {
-                            Ok(rx) => rx,
-                            Err(err) => {
-                                dbg!(err);
-                                continue;
-                            }
-                        };
-                        let handler = handler.clone();
-                        tokio::spawn(async move {
-                            if let Err(err) = handler.new_uni(peer_id, rx).await {
-                                dbg!(err);
-                            }
-                        });
+                let uni = conn2.accept_uni().await;
+                let rx = match uni {
+                    Ok(rx) => rx,
+                    Err(err) => {
+                        dbg!(err);
+                        break;
                     }
-                    bi = conn.accept_bi().fuse() => {
-                        let (tx, rx) = match bi {
-                            Ok((tx, rx)) => (tx, rx),
-                            Err(err) => {
-                                dbg!(err);
-                                continue;
-                            }
-                        };
-                        let handler = handler.clone();
-                        tokio::spawn(async move {
-                            if let Err(err) = handler.new_bi(peer_id, rx, tx).await {
-                                dbg!(err);
-                            }
-                        });
+                };
+                let handler = handler.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = handler.new_uni(peer_id, rx).await {
+                        dbg!(err);
                     }
-                }
+                });
+            }
+        });
+        let handler = self.0.clone();
+        tokio::spawn(async move {
+            loop {
+                let bi = conn.accept_bi().await;
+                let (tx, rx) = match bi {
+                    Ok((tx, rx)) => (tx, rx),
+                    Err(err) => {
+                        dbg!(err);
+                        break;
+                    }
+                };
+                let handler = handler.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = handler.new_bi(peer_id, rx, tx).await {
+                        dbg!(err);
+                    }
+                });
             }
         });
     }

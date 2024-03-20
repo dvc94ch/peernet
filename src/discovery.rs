@@ -136,7 +136,7 @@ impl InnerDiscovery {
     }
 
     async fn resolve(&self, peer_id: &PeerId) -> Result<AddrInfo> {
-        tracing::info!("resolving {}", peer_id);
+        tracing::debug!("resolving {}", peer_id);
         let origin = pkarr::PublicKey::try_from(*peer_id.as_bytes()).unwrap();
         let origin_z32 = origin.to_z32();
         if let Some(mdns) = self.mdns.as_ref() {
@@ -149,7 +149,7 @@ impl InnerDiscovery {
                 .find(|(peer, _)| peer == &origin_z32)
                 .map(|(_, instance_info)| instance_info_to_peer_addr(&instance_info))
             {
-                tracing::info!("resolved: {} to {:?} via mdns", peer_id, addr);
+                tracing::debug!("resolved: {} to {:?} via mdns", peer_id, addr);
                 return Ok(addr);
             }
         }
@@ -161,7 +161,7 @@ impl InnerDiscovery {
             };
             if let Some(msg) = msg {
                 let addr = packet_to_peer_addr(&msg);
-                tracing::info!("resolved: {} to {:?}", peer_id, addr);
+                tracing::debug!("resolved: {} to {:?}", peer_id, addr);
                 return Ok(addr);
             }
         }
@@ -176,10 +176,10 @@ impl InnerDiscovery {
         }
         if let Some(pkarr) = self.pkarr.as_ref() {
             if let Some(relay) = self.relay.as_ref() {
-                tracing::info!("publishing {:?} via relay {}", addr, relay);
+                tracing::debug!("publishing {:?} via relay {}", addr, relay);
                 pkarr.relay_put(relay, &packet).await?;
             } else {
-                tracing::info!("publishing {:?} via dht", addr);
+                tracing::debug!("publishing {:?} via dht", addr);
                 pkarr.publish(&packet).await?;
             }
         }
@@ -224,8 +224,8 @@ impl iroh_net::magicsock::Discovery for Discovery {
         let addr = addr.clone();
         tokio::spawn(async move {
             match discovery.publish(&addr).await {
-                Ok(()) => tracing::info!("done publishing"),
-                Err(err) => tracing::info!("failed to publish: {}", err),
+                Ok(()) => tracing::debug!("done publishing"),
+                Err(err) => tracing::debug!("failed to publish: {}", err),
             }
         });
     }

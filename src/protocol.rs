@@ -1,7 +1,7 @@
 use crate::{Connection, PeerId, RecvStream, SendStream};
 use anyhow::{Context, Result};
 use futures::channel::{mpsc, oneshot};
-use futures::{FutureExt, StreamExt};
+use futures::StreamExt;
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashMap;
 use std::io;

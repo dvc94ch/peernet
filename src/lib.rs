@@ -258,7 +258,7 @@ async fn republisher(endpoint: MagicEndpoint, period: u32) {
             continue;
         }
         if let Some(discovery) = endpoint.discovery() {
-            tracing::info!("republishing");
+            tracing::debug!("republishing");
             discovery.publish(&addr.info);
         }
     }

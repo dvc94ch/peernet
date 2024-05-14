@@ -286,8 +286,7 @@ impl ProtocolHandler {
                 let uni = conn2.accept_uni().await;
                 let rx = match uni {
                     Ok(rx) => rx,
-                    Err(err) => {
-                        dbg!(err);
+                    Err(_) => {
                         break;
                     }
                 };
@@ -305,8 +304,7 @@ impl ProtocolHandler {
                 let bi = conn.accept_bi().await;
                 let (tx, rx) = match bi {
                     Ok((tx, rx)) => (tx, rx),
-                    Err(err) => {
-                        dbg!(err);
+                    Err(_) => {
                         break;
                     }
                 };

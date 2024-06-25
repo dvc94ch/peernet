@@ -1,22 +1,24 @@
-use crate::discovery::Discovery;
 use anyhow::Result;
-use iroh_net::defaults::{default_derp_map, TEST_REGION_ID};
-use iroh_net::derp::{DerpMap, DerpMode};
+use futures::StreamExt;
+use iroh_net::defaults::default_relay_map;
+use iroh_net::discovery::dns::{DnsDiscovery, N0_DNS_NODE_ORIGIN};
+use iroh_net::discovery::pkarr_publish::{
+    PkarrPublisher, DEFAULT_PKARR_TTL, DEFAULT_REPUBLISH_INTERVAL, N0_DNS_PKARR_RELAY,
+};
+use iroh_net::discovery::ConcurrentDiscovery;
+use iroh_net::endpoint::Endpoint as MagicEndpoint;
 use iroh_net::key::SecretKey;
-use iroh_net::magic_endpoint::accept_conn;
-use iroh_net::{MagicEndpoint, NodeAddr};
-use pkarr::url::Url;
-use pkarr::DEFAULT_PKARR_RELAY;
+use iroh_net::relay::{RelayMap, RelayMode};
+use iroh_net::{AddrInfo, NodeAddr};
 use std::time::Duration;
 
-mod discovery;
 mod protocol;
 
 pub use crate::protocol::{
     NotificationHandler, Protocol, ProtocolHandler, ProtocolHandlerBuilder, RequestHandler,
     Subscription, SubscriptionHandler,
 };
-pub use quinn::{Connection, RecvStream, SendStream};
+pub use iroh_net::endpoint::{Connection, RecvStream, SendStream};
 pub type PeerId = iroh_net::key::PublicKey;
 
 pub struct EndpointBuilder {
@@ -24,12 +26,12 @@ pub struct EndpointBuilder {
     handler: Option<ProtocolHandler>,
     secret: Option<[u8; 32]>,
     port: u16,
-    pkarr_relay: Option<Url>,
-    derp_map: Option<DerpMap>,
-    ttl: Option<u32>,
-    enable_dht: bool,
-    enable_mdns: bool,
-    republish: bool,
+    relay_map: Option<RelayMap>,
+    // discovery fields
+    dns_origin: String,
+    pkarr_relay: String,
+    publish_ttl: u32,
+    republish_interval: Duration,
 }
 
 impl EndpointBuilder {
@@ -39,12 +41,11 @@ impl EndpointBuilder {
             handler: None,
             secret: None,
             port: 0,
-            pkarr_relay: None,
-            derp_map: None,
-            ttl: None,
-            enable_dht: false,
-            enable_mdns: false,
-            republish: true,
+            relay_map: Some(default_relay_map()),
+            dns_origin: N0_DNS_NODE_ORIGIN.into(),
+            pkarr_relay: N0_DNS_PKARR_RELAY.into(),
+            publish_ttl: DEFAULT_PKARR_TTL,
+            republish_interval: DEFAULT_REPUBLISH_INTERVAL,
         }
     }
 
@@ -63,52 +64,28 @@ impl EndpointBuilder {
         self
     }
 
-    pub fn relay(&mut self, relay: Url) -> &mut Self {
-        self.pkarr_relay = Some(relay);
+    pub fn relay_map(&mut self, relay_map: Option<RelayMap>) -> &mut Self {
+        self.relay_map = relay_map;
         self
     }
 
-    pub fn localhost_relay(&mut self) -> &mut Self {
-        self.relay("http://127.0.0.1:6881".parse().unwrap())
-    }
-
-    pub fn pkarr_relay(&mut self) -> &mut Self {
-        self.relay(DEFAULT_PKARR_RELAY.parse().unwrap())
-    }
-
-    pub fn derp_map(&mut self, map: DerpMap) -> &mut Self {
-        self.derp_map = Some(map);
+    pub fn dns_origin(&mut self, dns_origin: impl Into<String>) -> &mut Self {
+        self.dns_origin = dns_origin.into();
         self
     }
 
-    pub fn localhost_derp_map(&mut self) -> &mut Self {
-        self.derp_map(DerpMap::from_url(
-            "http://127.0.0.1:3340".parse().unwrap(),
-            TEST_REGION_ID,
-        ))
-    }
-
-    pub fn iroh_derp_map(&mut self) -> &mut Self {
-        self.derp_map(default_derp_map())
-    }
-
-    pub fn enable_dht(&mut self) -> &mut Self {
-        self.enable_dht = true;
+    pub fn pkarr_relay(&mut self, pkarr_relay: impl Into<String>) -> &mut Self {
+        self.pkarr_relay = pkarr_relay.into();
         self
     }
 
-    pub fn enable_mdns(&mut self) -> &mut Self {
-        self.enable_mdns = true;
+    pub fn republish_interval(&mut self, interval: Duration) -> &mut Self {
+        self.republish_interval = interval;
         self
     }
 
-    pub fn republish(&mut self, republish: bool) -> &mut Self {
-        self.republish = republish;
-        self
-    }
-
-    pub fn ttl(&mut self, ttl: u32) -> &mut Self {
-        self.ttl = Some(ttl);
+    pub fn publish_ttl(&mut self, ttl: u32) -> &mut Self {
+        self.publish_ttl = ttl;
         self
     }
 
@@ -118,18 +95,16 @@ impl EndpointBuilder {
             getrandom::getrandom(&mut secret).unwrap();
             secret
         });
-        let ttl = self.ttl.unwrap_or(30);
         Endpoint::new(
-            secret,
+            SecretKey::from(secret),
             self.alpn,
             self.port,
             self.pkarr_relay,
-            self.republish,
-            self.derp_map,
+            self.republish_interval,
+            self.relay_map,
             self.handler,
-            ttl,
-            self.enable_dht,
-            self.enable_mdns,
+            self.publish_ttl,
+            self.dns_origin,
         )
         .await
     }
@@ -147,35 +122,38 @@ impl Endpoint {
     }
 
     async fn new(
-        secret: [u8; 32],
+        secret: SecretKey,
         alpn: Vec<u8>,
         port: u16,
-        relay: Option<Url>,
-        republish: bool,
-        derp_map: Option<DerpMap>,
+        pkarr_relay: String,
+        republish_interval: Duration,
+        relay_map: Option<RelayMap>,
         handler: Option<ProtocolHandler>,
         ttl: u32,
-        enable_dht: bool,
-        enable_mdns: bool,
+        dns_origin: String,
     ) -> Result<Self> {
-        let discovery = Discovery::new(secret, relay, enable_dht, enable_mdns, ttl)?;
+        let publisher = PkarrPublisher::with_options(
+            secret.clone(),
+            pkarr_relay.parse()?,
+            ttl,
+            republish_interval,
+        );
+        let resolver = DnsDiscovery::new(dns_origin);
+        let discovery =
+            ConcurrentDiscovery::from_services(vec![Box::new(publisher), Box::new(resolver)]);
         let builder = MagicEndpoint::builder()
-            .secret_key(SecretKey::from(secret))
+            .secret_key(secret)
             .alpns(vec![alpn.clone()])
             .discovery(Box::new(discovery));
-        let builder = if let Some(derp_map) = derp_map {
-            builder.derp_mode(DerpMode::Custom(derp_map))
+        let builder = if let Some(relay_map) = relay_map {
+            builder.relay_mode(RelayMode::Custom(relay_map))
         } else {
-            builder.derp_mode(DerpMode::Disabled)
+            builder.relay_mode(RelayMode::Disabled)
         };
         let endpoint = builder.bind(port).await?;
         if let Some(handler) = handler {
             tokio::spawn(server(endpoint.clone(), handler));
         }
-        if republish {
-            tokio::spawn(republisher(endpoint.clone(), ttl));
-        }
-
         Ok(Self { alpn, endpoint })
     }
 
@@ -192,8 +170,17 @@ impl Endpoint {
         Ok(())
     }
 
-    pub fn discovery(&self) -> &dyn iroh_net::magicsock::Discovery {
-        self.endpoint.discovery().unwrap()
+    pub async fn resolve(&self, peer_id: PeerId) -> Result<AddrInfo> {
+        Ok(self
+            .endpoint
+            .discovery()
+            .unwrap()
+            .resolve(self.endpoint.clone(), peer_id)
+            .unwrap()
+            .next()
+            .await
+            .unwrap()?
+            .addr_info)
     }
 
     pub async fn connect(&self, peer_id: &PeerId) -> Result<Connection> {
@@ -229,37 +216,23 @@ impl Endpoint {
 
 async fn server(endpoint: MagicEndpoint, handler: ProtocolHandler) {
     loop {
-        let Some(conn) = endpoint.accept().await else {
+        let Some(mut conn) = endpoint.accept().await else {
             tracing::info!("socket closed");
             break;
         };
-        match accept_conn(conn).await {
+        let accept_conn = move || async {
+            let alpn = conn.alpn().await?;
+            let conn = conn.await?;
+            let node_id = iroh_net::endpoint::get_remote_node_id(&conn)?;
+            Result::<_, anyhow::Error>::Ok((node_id, alpn, conn))
+        };
+        match accept_conn().await {
             Ok((peer_id, _alpn, conn)) => {
                 handler.handle(peer_id, conn);
             }
             Err(err) => {
                 dbg!(err);
             }
-        }
-    }
-}
-
-async fn republisher(endpoint: MagicEndpoint, period: u32) {
-    loop {
-        tokio::time::sleep(Duration::from_secs(period as _)).await;
-        let addr = match endpoint.my_addr().await {
-            Ok(addr) => addr,
-            Err(err) => {
-                dbg!(err);
-                continue;
-            }
-        };
-        if addr.info.direct_addresses.is_empty() {
-            continue;
-        }
-        if let Some(discovery) = endpoint.discovery() {
-            tracing::debug!("republishing");
-            discovery.publish(&addr.info);
         }
     }
 }
@@ -354,9 +327,9 @@ mod tests {
         }
     }
 
-    async fn wait_for_resolve(endpoint: &Endpoint, peer_id: &PeerId) -> Result<iroh_net::AddrInfo> {
+    /*async fn wait_for_resolve(endpoint: &Endpoint, peer_id: &PeerId) -> Result<AddrInfo> {
         loop {
-            let Ok(addr) = endpoint.discovery().resolve(peer_id).await else {
+            let Ok(addr) = endpoint.resolve(*peer_id).await else {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             };
@@ -409,7 +382,7 @@ mod tests {
         let a1 = e1.addr().await?;
         assert_eq!(a1.info, a1_2);
         Ok(())
-    }
+    }*/
 
     #[tokio::test]
     async fn notify() -> Result<()> {

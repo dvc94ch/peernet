@@ -47,7 +47,7 @@ fn packet_to_peer_addr(packet: &SignedPacket) -> AddrInfo {
         .resource_records(DERP_REGION_KEY)
         .find_map(filter_u16);
     AddrInfo {
-        derp_region,
+        relay_url,
         direct_addresses,
     }
 }
@@ -63,7 +63,7 @@ fn peer_addr_to_packet(keypair: &Keypair, info: &AddrInfo, ttl: u32) -> Result<S
             RData::TXT(TXT::try_from(addr.as_str())?.into_owned()),
         ));
     }
-    if let Some(derp_region) = info.derp_region {
+    if let Some(derp_region) = info.relay_url {
         packet.answers.push(ResourceRecord::new(
             Name::new(DERP_REGION_KEY).unwrap(),
             CLASS::IN,
@@ -87,7 +87,7 @@ fn peer_addr_to_instance_info(addr: &AddrInfo) -> InstanceInformation {
 
 fn instance_info_to_peer_addr(instance_info: &InstanceInformation) -> AddrInfo {
     AddrInfo {
-        derp_region: None,
+        relay_url: None,
         direct_addresses: instance_info.get_socket_addresses().collect(),
     }
 }

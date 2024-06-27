@@ -2,10 +2,11 @@ use anyhow::Result;
 use futures::StreamExt;
 use iroh_net::defaults::default_relay_map;
 use iroh_net::discovery::dns::{DnsDiscovery, N0_DNS_NODE_ORIGIN};
-use iroh_net::discovery::pkarr_publish::{
-    PkarrPublisher, DEFAULT_PKARR_TTL, DEFAULT_REPUBLISH_INTERVAL, N0_DNS_PKARR_RELAY,
+use iroh_net::discovery::pkarr::{
+    PkarrPublisher, PkarrResolver, DEFAULT_PKARR_TTL, DEFAULT_REPUBLISH_INTERVAL,
+    N0_DNS_PKARR_RELAY,
 };
-use iroh_net::discovery::ConcurrentDiscovery;
+use iroh_net::discovery::{ConcurrentDiscovery, Discovery};
 use iroh_net::endpoint::Endpoint as MagicEndpoint;
 use iroh_net::key::SecretKey;
 use iroh_net::relay::{RelayMap, RelayMode};
@@ -21,6 +22,12 @@ pub use crate::protocol::{
 pub use iroh_net::endpoint::{Connection, RecvStream, SendStream};
 pub type PeerId = iroh_net::key::PublicKey;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolverMode {
+    Pkarr,
+    Dns,
+}
+
 pub struct EndpointBuilder {
     alpn: Vec<u8>,
     handler: Option<ProtocolHandler>,
@@ -28,6 +35,7 @@ pub struct EndpointBuilder {
     port: u16,
     relay_map: Option<RelayMap>,
     // discovery fields
+    resolver_mode: ResolverMode,
     dns_origin: String,
     pkarr_relay: String,
     publish_ttl: u32,
@@ -42,6 +50,7 @@ impl EndpointBuilder {
             secret: None,
             port: 0,
             relay_map: Some(default_relay_map()),
+            resolver_mode: ResolverMode::Pkarr,
             dns_origin: N0_DNS_NODE_ORIGIN.into(),
             pkarr_relay: N0_DNS_PKARR_RELAY.into(),
             publish_ttl: DEFAULT_PKARR_TTL,
@@ -66,6 +75,11 @@ impl EndpointBuilder {
 
     pub fn relay_map(&mut self, relay_map: Option<RelayMap>) -> &mut Self {
         self.relay_map = relay_map;
+        self
+    }
+
+    pub fn resolver_mode(&mut self, mode: ResolverMode) -> &mut Self {
+        self.resolver_mode = mode;
         self
     }
 
@@ -99,12 +113,13 @@ impl EndpointBuilder {
             SecretKey::from(secret),
             self.alpn,
             self.port,
-            self.pkarr_relay,
-            self.republish_interval,
             self.relay_map,
             self.handler,
-            self.publish_ttl,
+            self.resolver_mode,
+            self.pkarr_relay,
             self.dns_origin,
+            self.publish_ttl,
+            self.republish_interval,
         )
         .await
     }
@@ -125,22 +140,27 @@ impl Endpoint {
         secret: SecretKey,
         alpn: Vec<u8>,
         port: u16,
-        pkarr_relay: String,
-        republish_interval: Duration,
         relay_map: Option<RelayMap>,
         handler: Option<ProtocolHandler>,
-        ttl: u32,
+        resolver_mode: ResolverMode,
+        pkarr_relay: String,
         dns_origin: String,
+        ttl: u32,
+        republish_interval: Duration,
     ) -> Result<Self> {
-        let publisher = PkarrPublisher::with_options(
+        let publisher = Box::new(PkarrPublisher::with_options(
             secret.clone(),
             pkarr_relay.parse()?,
             ttl,
             republish_interval,
-        );
-        let resolver = DnsDiscovery::new(dns_origin);
-        let discovery =
-            ConcurrentDiscovery::from_services(vec![Box::new(publisher), Box::new(resolver)]);
+        ));
+        let resolver = match resolver_mode {
+            ResolverMode::Pkarr => {
+                Box::new(PkarrResolver::new(pkarr_relay.parse()?)) as Box<dyn Discovery>
+            }
+            ResolverMode::Dns => Box::new(DnsDiscovery::new(dns_origin)),
+        };
+        let discovery = ConcurrentDiscovery::from_services(vec![publisher, resolver]);
         let builder = MagicEndpoint::builder()
             .secret_key(secret)
             .alpns(vec![alpn.clone()])
@@ -162,7 +182,7 @@ impl Endpoint {
     }
 
     pub async fn addr(&self) -> Result<NodeAddr> {
-        Ok(self.endpoint.my_addr().await?)
+        Ok(self.endpoint.node_addr().await?)
     }
 
     pub fn add_address(&self, address: NodeAddr) -> Result<()> {
@@ -327,12 +347,17 @@ mod tests {
         }
     }
 
-    /*async fn wait_for_resolve(endpoint: &Endpoint, peer_id: &PeerId) -> Result<AddrInfo> {
+    async fn wait_for_resolve(endpoint: &Endpoint, peer_id: &PeerId) -> Result<AddrInfo> {
         loop {
-            let Ok(addr) = endpoint.resolve(*peer_id).await else {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                continue;
+            let addr = match endpoint.resolve(*peer_id).await {
+                Ok(addr) => addr,
+                Err(err) => {
+                    tracing::error!("resolve error: {err}");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
             };
+            tracing::info!("got addr: {:?}", addr);
             if addr.direct_addresses.is_empty() {
                 tracing::info!("waiting for resolve");
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -342,7 +367,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    /*#[tokio::test]
     async fn mdns() -> Result<()> {
         env_logger::try_init().ok();
 
@@ -361,28 +386,28 @@ mod tests {
         let a1 = e1.addr().await?;
         assert_eq!(a1.info, a1_2);
         Ok(())
-    }
+    }*/
 
     #[tokio::test]
     async fn pkarr() -> Result<()> {
         env_logger::try_init().ok();
 
         let mut builder = Endpoint::builder(ALPN.to_vec());
-        builder.enable_dht();
+        builder.relay_map(None);
         let e1 = builder.build().await?;
         let p1 = e1.peer_id();
 
-        let mut builder = Endpoint::builder(ALPN.to_vec());
-        builder.enable_dht();
+        let builder = Endpoint::builder(ALPN.to_vec());
         let e2 = builder.build().await?;
 
+        tracing::info!("waiting for resolve");
         let a1_2 = wait_for_resolve(&e2, &p1).await?;
         tracing::info!("resolved {:?}", a1_2);
 
         let a1 = e1.addr().await?;
         assert_eq!(a1.info, a1_2);
         Ok(())
-    }*/
+    }
 
     #[tokio::test]
     async fn notify() -> Result<()> {

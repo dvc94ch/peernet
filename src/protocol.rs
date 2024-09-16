@@ -21,7 +21,8 @@ async fn send_request<P: Protocol>(tx: &mut SendStream, req: &P::Request) -> Res
     tx.write_u16(P::ID).await?;
     let bytes = bincode::serialize(req)?;
     tx.write_all(&bytes).await?;
-    tx.finish().await?;
+    tx.finish()?;
+    tx.stopped().await?;
     Ok(())
 }
 
@@ -32,7 +33,8 @@ async fn recv_request<P: Protocol>(rx: &mut RecvStream) -> Result<P::Request> {
 
 pub async fn notify<P: Protocol>(conn: &mut Connection, req: &P::Request) -> Result<()> {
     let mut tx = conn.open_uni().await?;
-    send_request::<P>(&mut tx, req).await
+    send_request::<P>(&mut tx, req).await?;
+    Ok(())
 }
 
 pub async fn request_response<P: Protocol>(
@@ -183,7 +185,7 @@ where
         let res = hrx.await?;
         let bytes = bincode::serialize(&res)?;
         tx.write_all(&bytes).await?;
-        tx.finish().await?;
+        tx.finish()?;
         Ok(())
     }
 }
@@ -226,7 +228,7 @@ where
             tx.write_u16(bytes.len().try_into()?).await?;
             tx.write_all(&bytes).await?;
         }
-        tx.finish().await?;
+        tx.finish()?;
         Ok(())
     }
 }

@@ -1,10 +1,9 @@
 use anyhow::Result;
 use futures::StreamExt;
-use iroh_net::defaults::default_relay_map;
-use iroh_net::discovery::dns::{DnsDiscovery, N0_DNS_NODE_ORIGIN};
+use iroh_net::defaults::prod::default_relay_map;
+use iroh_net::discovery::dns::{DnsDiscovery, N0_DNS_NODE_ORIGIN_PROD};
 use iroh_net::discovery::pkarr::{
-    PkarrPublisher, PkarrResolver, DEFAULT_PKARR_TTL, DEFAULT_REPUBLISH_INTERVAL,
-    N0_DNS_PKARR_RELAY,
+    PkarrPublisher, PkarrResolver, DEFAULT_REPUBLISH_INTERVAL, N0_DNS_PKARR_RELAY_PROD,
 };
 use iroh_net::discovery::{ConcurrentDiscovery, Discovery};
 use iroh_net::endpoint::Endpoint as MagicEndpoint;
@@ -38,7 +37,7 @@ pub struct EndpointBuilder {
     resolver_mode: ResolverMode,
     dns_origin: String,
     pkarr_relay: String,
-    publish_ttl: u32,
+    publish_ttl: Duration,
     republish_interval: Duration,
 }
 
@@ -51,9 +50,9 @@ impl EndpointBuilder {
             port: 0,
             relay_map: Some(default_relay_map()),
             resolver_mode: ResolverMode::Pkarr,
-            dns_origin: N0_DNS_NODE_ORIGIN.into(),
-            pkarr_relay: N0_DNS_PKARR_RELAY.into(),
-            publish_ttl: DEFAULT_PKARR_TTL,
+            dns_origin: N0_DNS_NODE_ORIGIN_PROD.into(),
+            pkarr_relay: N0_DNS_PKARR_RELAY_PROD.into(),
+            publish_ttl: DEFAULT_REPUBLISH_INTERVAL * 4,
             republish_interval: DEFAULT_REPUBLISH_INTERVAL,
         }
     }
@@ -98,7 +97,7 @@ impl EndpointBuilder {
         self
     }
 
-    pub fn publish_ttl(&mut self, ttl: u32) -> &mut Self {
+    pub fn publish_ttl(&mut self, ttl: Duration) -> &mut Self {
         self.publish_ttl = ttl;
         self
     }
@@ -145,13 +144,13 @@ impl Endpoint {
         resolver_mode: ResolverMode,
         pkarr_relay: String,
         dns_origin: String,
-        ttl: u32,
+        ttl: Duration,
         republish_interval: Duration,
     ) -> Result<Self> {
         let publisher = Box::new(PkarrPublisher::with_options(
             secret.clone(),
             pkarr_relay.parse()?,
-            ttl,
+            ttl.as_secs().try_into()?,
             republish_interval,
         ));
         let resolver = match resolver_mode {
@@ -203,21 +202,21 @@ impl Endpoint {
             .addr_info)
     }
 
-    pub async fn connect(&self, peer_id: &PeerId) -> Result<Connection> {
+    pub async fn connect(&self, peer_id: PeerId) -> Result<Connection> {
         Ok(self
             .endpoint
             .connect_by_node_id(peer_id, &self.alpn)
             .await?)
     }
 
-    pub async fn notify<P: Protocol>(&self, peer_id: &PeerId, msg: &P::Request) -> Result<()> {
+    pub async fn notify<P: Protocol>(&self, peer_id: PeerId, msg: &P::Request) -> Result<()> {
         let mut conn = self.connect(peer_id).await?;
         crate::protocol::notify::<P>(&mut conn, msg).await
     }
 
     pub async fn request<P: Protocol>(
         &self,
-        peer_id: &PeerId,
+        peer_id: PeerId,
         msg: &P::Request,
     ) -> Result<P::Response> {
         let mut conn = self.connect(peer_id).await?;
@@ -226,7 +225,7 @@ impl Endpoint {
 
     pub async fn subscribe<P: Protocol>(
         &self,
-        peer_id: &PeerId,
+        peer_id: PeerId,
         msg: &P::Request,
     ) -> Result<Subscription<P::Response>> {
         let mut conn = self.connect(peer_id).await?;
@@ -236,18 +235,17 @@ impl Endpoint {
 
 async fn server(endpoint: MagicEndpoint, handler: ProtocolHandler) {
     loop {
-        let Some(mut conn) = endpoint.accept().await else {
+        let Some(conn) = endpoint.accept().await else {
             tracing::info!("socket closed");
             break;
         };
         let accept_conn = move || async {
-            let alpn = conn.alpn().await?;
             let conn = conn.await?;
             let node_id = iroh_net::endpoint::get_remote_node_id(&conn)?;
-            Result::<_, anyhow::Error>::Ok((node_id, alpn, conn))
+            Result::<_, anyhow::Error>::Ok((node_id, conn))
         };
         match accept_conn().await {
-            Ok((peer_id, _alpn, conn)) => {
+            Ok((peer_id, conn)) => {
                 handler.handle(peer_id, conn);
             }
             Err(err) => {
@@ -335,7 +333,7 @@ mod tests {
         }
     }
 
-    async fn wait_for_publish(endpoint: &Endpoint) -> Result<NodeAddr> {
+    async fn wait_for_addr(endpoint: &Endpoint) -> Result<NodeAddr> {
         loop {
             let addr = endpoint.addr().await?;
             if addr.info.direct_addresses.is_empty() {
@@ -347,19 +345,16 @@ mod tests {
         }
     }
 
-    async fn wait_for_resolve(endpoint: &Endpoint, peer_id: &PeerId) -> Result<AddrInfo> {
+    async fn wait_for_resolve(endpoint: &Endpoint) -> Result<NodeAddr> {
         loop {
-            let addr = match endpoint.resolve(*peer_id).await {
-                Ok(addr) => addr,
-                Err(err) => {
-                    tracing::error!("resolve error: {err}");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    continue;
-                }
+            let addr = wait_for_addr(endpoint).await?;
+            let Ok(resolved_addr) = endpoint.resolve(endpoint.peer_id()).await else {
+                tracing::info!("waiting for publish");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
             };
-            tracing::info!("got addr: {:?}", addr);
-            if addr.direct_addresses.is_empty() {
-                tracing::info!("waiting for resolve");
+            if addr.info != resolved_addr {
+                tracing::info!("waiting for publish");
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
@@ -395,17 +390,7 @@ mod tests {
         let mut builder = Endpoint::builder(ALPN.to_vec());
         builder.relay_map(None);
         let e1 = builder.build().await?;
-        let p1 = e1.peer_id();
-
-        let builder = Endpoint::builder(ALPN.to_vec());
-        let e2 = builder.build().await?;
-
-        tracing::info!("waiting for resolve");
-        let a1_2 = wait_for_resolve(&e2, &p1).await?;
-        tracing::info!("resolved {:?}", a1_2);
-
-        let a1 = e1.addr().await?;
-        assert_eq!(a1.info, a1_2);
+        wait_for_resolve(&e1).await?;
         Ok(())
     }
 
@@ -426,10 +411,10 @@ mod tests {
         let builder = Endpoint::builder(ALPN.to_vec());
         let e2 = builder.build().await?;
 
-        let a1 = wait_for_publish(&e1).await?;
+        let a1 = wait_for_addr(&e1).await?;
 
         e2.add_address(a1)?;
-        e2.notify::<PingPong>(&p1, &Ping(42)).await?;
+        e2.notify::<PingPong>(p1, &Ping(42)).await?;
         let ping = rx.await?;
         assert_eq!(ping.0, 42);
         Ok(())
@@ -451,10 +436,10 @@ mod tests {
         let builder = Endpoint::builder(ALPN.to_vec());
         let e2 = builder.build().await?;
 
-        let a1 = wait_for_publish(&e1).await?;
+        let a1 = wait_for_addr(&e1).await?;
 
         e2.add_address(a1)?;
-        let pong = e2.request::<PingPong>(&p1, &Ping(42)).await?;
+        let pong = e2.request::<PingPong>(p1, &Ping(42)).await?;
         assert_eq!(pong.0, 42);
         Ok(())
     }
@@ -475,10 +460,10 @@ mod tests {
         let builder = Endpoint::builder(ALPN.to_vec());
         let e2 = builder.build().await?;
 
-        let a1 = wait_for_publish(&e1).await?;
+        let a1 = wait_for_addr(&e1).await?;
 
         e2.add_address(a1)?;
-        let mut subscription = e2.subscribe::<PingPong>(&p1, &Ping(42)).await?;
+        let mut subscription = e2.subscribe::<PingPong>(p1, &Ping(42)).await?;
         while let Some(pong) = subscription.next().await? {
             assert_eq!(pong.0, 42);
         }

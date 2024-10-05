@@ -31,7 +31,6 @@ pub struct EndpointBuilder {
     alpn: Vec<u8>,
     handler: Option<ProtocolHandler>,
     secret: Option<[u8; 32]>,
-    port: u16,
     relay_map: Option<RelayMap>,
     // discovery fields
     resolver_mode: ResolverMode,
@@ -47,7 +46,6 @@ impl EndpointBuilder {
             alpn,
             handler: None,
             secret: None,
-            port: 0,
             relay_map: Some(default_relay_map()),
             resolver_mode: ResolverMode::Pkarr,
             dns_origin: N0_DNS_NODE_ORIGIN_PROD.into(),
@@ -59,11 +57,6 @@ impl EndpointBuilder {
 
     pub fn secret(&mut self, secret: [u8; 32]) -> &mut Self {
         self.secret = Some(secret);
-        self
-    }
-
-    pub fn port(&mut self, port: u16) -> &mut Self {
-        self.port = port;
         self
     }
 
@@ -111,7 +104,6 @@ impl EndpointBuilder {
         Endpoint::new(
             SecretKey::from(secret),
             self.alpn,
-            self.port,
             self.relay_map,
             self.handler,
             self.resolver_mode,
@@ -138,7 +130,6 @@ impl Endpoint {
     async fn new(
         secret: SecretKey,
         alpn: Vec<u8>,
-        port: u16,
         relay_map: Option<RelayMap>,
         handler: Option<ProtocolHandler>,
         resolver_mode: ResolverMode,
@@ -169,7 +160,7 @@ impl Endpoint {
         } else {
             builder.relay_mode(RelayMode::Disabled)
         };
-        let endpoint = builder.bind(port).await?;
+        let endpoint = builder.bind().await?;
         if let Some(handler) = handler {
             tokio::spawn(server(endpoint.clone(), handler));
         }

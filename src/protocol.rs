@@ -295,7 +295,7 @@ impl ProtocolHandler {
                 let handler = handler.clone();
                 tokio::spawn(async move {
                     if let Err(err) = handler.new_uni(peer_id, rx).await {
-                        dbg!(err);
+                        tracing::error!("{err}");
                     }
                 });
             }
@@ -313,7 +313,7 @@ impl ProtocolHandler {
                 let handler = handler.clone();
                 tokio::spawn(async move {
                     if let Err(err) = handler.new_bi(peer_id, rx, tx).await {
-                        dbg!(err);
+                        tracing::error!("{err}");
                     }
                 });
             }

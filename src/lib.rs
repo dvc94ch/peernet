@@ -240,7 +240,7 @@ async fn server(endpoint: MagicEndpoint, handler: ProtocolHandler) {
                 handler.handle(peer_id, conn);
             }
             Err(err) => {
-                dbg!(err);
+                tracing::error!("{err}");
             }
         }
     }

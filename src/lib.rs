@@ -1,15 +1,15 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use futures::StreamExt;
-use iroh_net::defaults::prod::default_relay_map;
-use iroh_net::discovery::dns::{DnsDiscovery, N0_DNS_NODE_ORIGIN_PROD};
-use iroh_net::discovery::pkarr::{
+use iroh::defaults::prod::default_relay_map;
+use iroh::discovery::dns::{DnsDiscovery, N0_DNS_NODE_ORIGIN_PROD};
+use iroh::discovery::pkarr::{
     PkarrPublisher, PkarrResolver, DEFAULT_REPUBLISH_INTERVAL, N0_DNS_PKARR_RELAY_PROD,
 };
-use iroh_net::discovery::{ConcurrentDiscovery, Discovery};
-use iroh_net::endpoint::Endpoint as MagicEndpoint;
-use iroh_net::key::SecretKey;
-use iroh_net::relay::{RelayMap, RelayMode};
-use iroh_net::{AddrInfo, NodeAddr};
+use iroh::discovery::{ConcurrentDiscovery, Discovery};
+use iroh::endpoint::Endpoint as MagicEndpoint;
+use iroh::NodeAddr;
+use iroh::{PublicKey, SecretKey};
+use iroh::{RelayMap, RelayMode};
 use std::time::Duration;
 
 mod protocol;
@@ -18,8 +18,8 @@ pub use crate::protocol::{
     NotificationHandler, Protocol, ProtocolHandler, ProtocolHandlerBuilder, RequestHandler,
     Subscription, SubscriptionHandler,
 };
-pub use iroh_net::endpoint::{Connection, RecvStream, SendStream};
-pub type PeerId = iroh_net::key::PublicKey;
+pub use iroh::endpoint::{Connection, RecvStream, SendStream};
+pub type PeerId = PublicKey;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResolverMode {
@@ -180,24 +180,21 @@ impl Endpoint {
         Ok(())
     }
 
-    pub async fn resolve(&self, peer_id: PeerId) -> Result<AddrInfo> {
+    pub async fn resolve(&self, peer_id: PeerId) -> Result<NodeAddr> {
         Ok(self
             .endpoint
             .discovery()
-            .unwrap()
+            .ok_or(anyhow!("no descovery"))?
             .resolve(self.endpoint.clone(), peer_id)
-            .unwrap()
+            .ok_or(anyhow!("no item resolved"))?
             .next()
             .await
-            .unwrap()?
-            .addr_info)
+            .ok_or(anyhow!("no item discovered"))??
+            .to_node_addr())
     }
 
     pub async fn connect(&self, peer_id: PeerId) -> Result<Connection> {
-        Ok(self
-            .endpoint
-            .connect_by_node_id(peer_id, &self.alpn)
-            .await?)
+        Ok(self.endpoint.connect(peer_id, &self.alpn).await?)
     }
 
     pub async fn notify<P: Protocol>(&self, peer_id: PeerId, msg: &P::Request) -> Result<()> {
@@ -232,7 +229,7 @@ async fn server(endpoint: MagicEndpoint, handler: ProtocolHandler) {
         };
         let accept_conn = move || async {
             let conn = conn.await?;
-            let node_id = iroh_net::endpoint::get_remote_node_id(&conn)?;
+            let node_id = conn.remote_node_id()?;
             Result::<_, anyhow::Error>::Ok((node_id, conn))
         };
         match accept_conn().await {
@@ -327,7 +324,7 @@ mod tests {
     async fn wait_for_addr(endpoint: &Endpoint) -> Result<NodeAddr> {
         loop {
             let addr = endpoint.addr().await?;
-            if addr.info.direct_addresses.is_empty() {
+            if addr.direct_addresses.is_empty() {
                 tracing::info!("waiting for publish");
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
@@ -344,7 +341,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             };
-            if addr.info != resolved_addr {
+            if addr != resolved_addr {
                 tracing::info!("waiting for publish");
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
